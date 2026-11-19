@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="vi"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#1e4fa8">
+<title>Kiểm tra km</title>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<style>
+body{font-family:sans-serif;margin:0;padding:16px;background:#f2f2f2}
+label{display:block;margin:12px 0 4px;color:#1e4fa8;font-weight:600}
+input,textarea{width:100%;box-sizing:border-box;padding:10px;font-size:16px;border:1px solid #ccc;border-radius:8px}
+.row{display:flex;gap:8px}
+button,.pick{display:block;width:100%;box-sizing:border-box;text-align:center;margin-top:14px;padding:14px;font-size:17px;background:#1e4fa8;color:#fff;border:0;border-radius:10px}
+.pick{background:#2e7d32}
+#out,#st{margin-top:14px;padding:12px;background:#fff;border-radius:10px;white-space:pre-wrap;display:none}
+.bad{color:#d32f2f;font-weight:700}.ok{color:#2e7d32;font-weight:700}
+</style></head><body>
+
+<label class="pick">📷 Chọn ảnh đơn hàng
+<input id="img" type="file" accept="image/*" hidden></label>
+<div id="st"></div>
+
+<label>Điểm nhận hàng</label><input id="from">
+<label>Điểm giao (trên đơn)</label><input id="to">
+<label>Khách nhắn</label><textarea id="note" rows="2"></textarea>
+<div class="row">
+  <div><label>Km hệ thống</label><input id="sys" type="number" step="0.1"></div>
+  <div><label>Ngưỡng lệch (km)</label><input id="th" type="number" step="0.1" value="0.5"></div>
+</div>
+<div class="row">
+  <div><label>Giá/km (đ)</label><input id="ppk" type="number" placeholder="tuỳ chọn"></div>
+  <div><label>Khu vực</label><input id="area" value="Vinh, Nghệ An"></div>
+</div>
+<button id="go">Tính lại quãng đường</button>
+<div id="out"></div>
+<button id="copy" style="display:none;background:#555">Copy tin nhắn báo tổng đài</button>
+
+<script>
+const $=id=>document.getElementById(id);
+['th','ppk','area'].forEach(k=>{const v=localStorage.getItem(k);if(v!==null)$(k).value=v;$(k).oninput=()=>localStorage.setItem(k,$(k).value);});
+if('serviceWorker'in navigator)navigator.serviceWorker.register('sw.js');
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const status=t=>{$('st').style.display='block';$('st').textContent=t;};
+
+// ---------- OCR + parse ----------
+$('img').onchange=async e=>{
+  const f=e.target.files[0];if(!f)return;
+  status('Đang đọc ảnh (lần đầu tải dữ liệu tiếng Việt, chờ chút)...');
+  try{
+    const {data:{text}}=await Tesseract.recognize(f,'vie',{logger:m=>{if(m.status==='recognizing text')status('Đang đọc ảnh... '+Math.round(m.progress*100)+'%');}});
+    const p=parse(text);
+    $('from').value=p.from;$('to').value=p.to;$('note').value=p.note;$('sys').value=p.km;
+    status('Đã đọc xong. Kiểm tra lại các ô, sửa nếu OCR đọc sai rồi bấm Tính lại.');
+    if(p.from&&p.to&&p.km)$('go').click();
+  }catch(err){status('Lỗi đọc ảnh: '+err.message);}
+};
+function parse(text){
+  const L=text.split('\n').map(s=>s.trim()).filter(Boolean);
+  const iNote=L.findIndex(s=>/kh[aáàả]ch\s*nh[aắ]n/i.test(s));
+  const iKm=L.findIndex(s=>/kho[aả]ng\s*c[aá]ch/i.test(s));
+  const iPhone=L.findIndex(s=>/0\d{9}/.test(s.replace(/\s/g,'')));
+  const clean=s=>s.replace(/^[^\p{L}\d]+/u,'').trim();
+  const end=iNote>0?iNote:(iKm>0?iKm:L.length);
+  const addr=L.slice(iPhone+1,end).map(clean).filter(s=>s.length>3);
+  let note='';
+  if(iNote>=0){const e=iKm>iNote?iKm:iNote+3;note=L.slice(iNote+1,e).join(' ');}
+  const kmLine=L.slice(iKm>=0?iKm:0).join(' ');
+  const m=kmLine.match(/(\d+[.,]\d+|\d+)\s*km/i);
+  return{from:addr[0]||'',to:addr[1]||'',note:note.trim(),km:m?m[1].replace(',','.'):''};
+}
+
+// ---------- Geocode + route ----------
+async function geo(q){
+  const m=q.match(/^\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*$/);
+  if(m)return{lat:+m[1],lng:+m[2],name:q};
+  const r=await fetch('https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=vn&q='+encodeURIComponent(q+', '+$('area').value));
+  const j=await r.json();
+  if(!j.length)return null;
+  return{lat:+j[0].lat,lng:+j[0].lon,name:j[0].display_name};
+}
+async function geoTry(list){
+  for(const q of list){if(!q)continue;const g=await geo(q);await sleep(1100);if(g)return g;}
+  return null;
+}
+async function route(a,b){
+  const u=`https://router.project-osrm.org/route/v1/driving/${a.lng},${a.lat};${b.lng},${b.lat}?overview=false`;
+  const j=await(await fetch(u)).json();
+  if(!j.routes||!j.routes.length)throw new Error('Không tìm được tuyến đường');
+  return j.routes[0].distance/1000;
+}
+
+let msg='';
+$('go').onclick=async()=>{
+  const out=$('out');out.style.display='block';out.textContent='Đang tính...';
+  try{
+    const sys=parseFloat($('sys').value),th=parseFloat($('th').value)||0.5,ppk=parseFloat($('ppk').value)||0;
+    const from=$('from').value,to=$('to').value,note=$('note').value.trim();
+    if(!from||!to||!sys)throw new Error('Thiếu điểm nhận, điểm giao hoặc km hệ thống');
+    const a=await geoTry([from]);
+    if(!a)throw new Error('Không tìm thấy điểm nhận: '+from);
+    const bOrder=await geoTry([to]);
+    const noteVariants=note?[note,note.replace(/^(s[oố]\s*)?nh[aà]\s*\S+\s*/i,'')]:[];
+    const bNote=await geoTry(noteVariants);
+    if(!bOrder&&!bNote)throw new Error('Không tìm thấy điểm giao');
+
+    const kmOrder=bOrder?await route(a,bOrder):null;
+    const kmNote=bNote?await route(a,bNote):null;
+    const real=kmNote??kmOrder; // ưu tiên địa chỉ khách nhắn
+    const diff=real-sys,abs=Math.abs(diff),flag=abs>=th;
+    const dir=diff>0?'DÀI HƠN':'NGẮN HƠN';
+    const dest=kmNote!=null?note:to;
+
+    msg=`Đơn ${from} → ${dest}: hệ thống ${sys.toFixed(1)} km, thực tế ${real.toFixed(1)} km (${dir} ${abs.toFixed(1)} km)`
+      +(ppk?`, chênh khoảng ${Math.round(abs*ppk).toLocaleString('vi')}đ`:'')+'. Nhờ tổng đài tính lại giúp.';
+
+    out.innerHTML=`Hệ thống: ${sys.toFixed(1)} km\n`
+      +(kmOrder!=null?`Theo địa chỉ trên đơn: ${kmOrder.toFixed(1)} km\n`:'Địa chỉ trên đơn: không tìm thấy\n')
+      +(kmNote!=null?`Theo khách nhắn: <b>${kmNote.toFixed(1)} km</b>\n`:'Khách nhắn: không định vị được, dùng địa chỉ trên đơn\n')
+      +`\n<span class="${flag?'bad':'ok'}">${flag?'Lệch '+dir+' '+abs.toFixed(1)+' km (so với km thực tế ship đi)':'Trong ngưỡng, không cần báo'}</span>\n\n`
+      +`Điểm giao tìm được:\n${(bNote||bOrder).name}`;
+    $('copy').style.display=flag?'block':'none';
+
+    if(flag){
+      if(Notification.permission!=='granted')await Notification.requestPermission();
+      if(Notification.permission==='granted'){
+        const reg=await navigator.serviceWorker.ready;
+        reg.showNotification('Nhắc báo tổng đài: lệch '+abs.toFixed(1)+' km',{body:msg,vibrate:[200,100,200]});
+      }
+    }
+  }catch(e){out.textContent='Lỗi: '+e.message;}
+};
+$('copy').onclick=()=>navigator.clipboard.writeText(msg).then(()=>alert('Đã copy'));
+</script></body></html>
